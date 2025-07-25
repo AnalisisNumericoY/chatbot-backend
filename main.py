@@ -46,28 +46,58 @@ async def upload_file(file: UploadFile):
     except Exception as e:
         return {"error": str(e)}, 500
 
+
+
+# Configura CORS (¡IMPORTANTE!)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Permite todos los orígenes
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# Modelo para validación de entrada
+class QuestionRequest(BaseModel):
+    question: str
+
 @app.post("/ask")
 async def ask_question(request: Request):
     try:
+        # Parsear el JSON manualmente
         data = await request.json()
         question = data.get("question")
+        
         if not question:
-            return {"error": "No se recibió la pregunta"}, 400
+            raise HTTPException(status_code=400, detail="No se recibió la pregunta")
+        
         if index.ntotal == 0 or not stored_chunks:
-            return {"error": "No hay información cargada"}, 400
+            raise HTTPException(status_code=400, detail="No hay información cargada")
 
-        q_embedding = openai.Embedding.create(input=question, model="text-embedding-3-small")["data"][0]["embedding"]
+        # Generar embedding
+        q_embedding = openai.Embedding.create(
+            input=question, 
+            model="text-embedding-3-small"
+        )["data"][0]["embedding"]
+
+        # Búsqueda de chunks similares
         D, I = index.search(np.array([q_embedding]), k=3)
         similar_chunks = [stored_chunks[i] for i in I[0] if i < len(stored_chunks)]
-
         context = "\n---\n".join(similar_chunks)
+
+        # Generar respuesta con GPT
         response = openai.ChatCompletion.create(
-            model="gpt-4-mini",
-            messages=[{"role": "user", "content": f"Contexto:\n{context}\n\nPregunta: {question}"}]
+            model="gpt-4",  # Cambiado de "gpt-4-mini" a "gpt-4"
+            messages=[
+                {"role": "system", "content": "Responde basándote en el contexto proporcionado."},
+                {"role": "user", "content": f"Contexto:\n{context}\n\nPregunta: {question}"}
+            ]
         )
+
         return {
+            "status": "success",
             "answer": response.choices[0].message.content,
             "context": similar_chunks
         }
+
     except Exception as e:
-        return {"error": str(e)}, 500
+        raise HTTPException(status_code=500, detail=str(e))
