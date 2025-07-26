@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, HTTPException, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
-import openai
+from openai import OpenAI  # Nueva importación
 import faiss
 import numpy as np
 from dotenv import load_dotenv
@@ -11,7 +11,7 @@ import json
 
 app = FastAPI()
 
-# Configuración CORS (imprescindible)
+# Configuración CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,7 +21,7 @@ app.add_middleware(
 )
 
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Nueva inicialización
 
 index = faiss.IndexFlatL2(1536)
 stored_chunks = []
@@ -38,29 +38,38 @@ def chunk_text(text, chunk_size=1000, overlap=200):
 @app.post("/upload")
 async def upload_file(file: UploadFile):
     try:
+        # Verificar tipo de archivo
+        if not file.filename.endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Solo se aceptan archivos PDF")
+        
         reader = PdfReader(file.file)
         full_text = ""
         for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                full_text += page_text + "\n"
+            try:
+                page_text = page.extract_text()
+                if page_text:
+                    full_text += page_text + "\n"
+            except:
+                continue
         
         if not full_text.strip():
-            raise HTTPException(status_code=400, detail="El PDF no contiene texto legible")
+            raise HTTPException(status_code=400, detail="No se pudo extraer texto del PDF. ¿Está escaneado?")
 
         chunks = chunk_text(full_text)
         embeddings = []
         for chunk in chunks:
-            emb = openai.Embedding.create(
+            emb = client.embeddings.create(  # Llamada actualizada
                 input=chunk,
                 model="text-embedding-3-small"
-            )["data"][0]["embedding"]
+            ).data[0].embedding
             embeddings.append(emb)
         
         index.add(np.array(embeddings))
         stored_chunks.extend(chunks)
-        return {"status": "success", "message": f"PDF procesado con {len(chunks)} fragmentos"}
+        return {"status": "success", "message": f"PDF procesado. {len(chunks)} fragmentos almacenados."}
     
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al procesar PDF: {str(e)}")
 
@@ -70,34 +79,36 @@ class QuestionRequest(BaseModel):
 @app.post("/ask")
 async def ask_question(request: Request):
     try:
-        # Manejo compatible con Streamlit y React
+        # Compatibilidad con diferentes formatos de solicitud
         try:
             data = await request.json()
-            question = data.get("question")
         except:
             body = await request.body()
             data = json.loads(body)
-            question = data.get("question")
         
+        question = data.get("question")
         if not question:
             raise HTTPException(status_code=400, detail="No se recibió pregunta")
         
         if index.ntotal == 0:
-            raise HTTPException(status_code=400, detail="Primero carga documentos via /upload")
+            raise HTTPException(status_code=400, detail="Primero carga documentos PDF via /upload")
 
-        q_embedding = openai.Embedding.create(
+        # Generar embedding
+        q_embedding = client.embeddings.create(  # Llamada actualizada
             input=question,
             model="text-embedding-3-small"
-        )["data"][0]["embedding"]
+        ).data[0].embedding
 
+        # Búsqueda de chunks similares
         D, I = index.search(np.array([q_embedding]), k=3)
         similar_chunks = [stored_chunks[i] for i in I[0] if i < len(stored_chunks)]
         context = "\n---\n".join(similar_chunks)
 
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
+        # Generar respuesta
+        response = client.chat.completions.create(  # Llamada actualizada
+            model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "Responde basándote en el contexto"},
+                {"role": "system", "content": "Responde basándote en el contexto proporcionado."},
                 {"role": "user", "content": f"Contexto:\n{context}\n\nPregunta: {question}"}
             ],
             temperature=0.7
