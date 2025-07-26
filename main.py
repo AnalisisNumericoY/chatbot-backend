@@ -53,7 +53,10 @@ async def upload_file(file: UploadFile):
                 continue
         
         if not full_text.strip():
-            raise HTTPException(status_code=400, detail="No se pudo extraer texto del PDF. ¿Está escaneado?")
+            raise HTTPException(
+            status_code=400,
+            detail="No pude leer el texto de este PDF. Por favor verifica que: \n1. El PDF contenga texto seleccionable (no sea una imagen escaneada)\n2. No esté protegido con contraseña\n3. Tenga al menos un párrafo de texto"
+            )
 
         chunks = chunk_text(full_text)
         embeddings = []
@@ -91,8 +94,10 @@ async def ask_question(request: Request):
             raise HTTPException(status_code=400, detail="No se recibió pregunta")
         
         if index.ntotal == 0:
-            raise HTTPException(status_code=400, detail="Primero carga documentos PDF via /upload")
-
+            raise HTTPException(
+            status_code=400,
+            detail="Actualmente no tengo documentos cargados. Puedes preguntarme cosas generales, pero para consultas específicas por favor carga documentos PDF en la página de administración."
+            )
         # Generar embedding
         q_embedding = client.embeddings.create(  # Llamada actualizada
             input=question,
