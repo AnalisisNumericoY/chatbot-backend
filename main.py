@@ -1,4 +1,6 @@
-from fastapi import FastAPI, UploadFile, Request
+from fastapi import FastAPI, UploadFile, HTTPException, Request
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 import openai
 import faiss
@@ -8,11 +10,23 @@ import os
 
 app = FastAPI()
 
+# Configura CORS primero
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 index = faiss.IndexFlatL2(1536)
-stored_chunks = []  # Guarda los chunks para referencia
+stored_chunks = []
+
+class QuestionRequest(BaseModel):
+    question: str
 
 def chunk_text(text, chunk_size=1000, overlap=200):
     chunks = []
@@ -32,50 +46,40 @@ async def upload_file(file: UploadFile):
             page_text = page.extract_text()
             if page_text:
                 full_text += page_text + "\n"
+        
         if not full_text.strip():
-            return {"error": "No se pudo extraer texto del PDF"}, 400
+            raise HTTPException(status_code=400, detail="No se pudo extraer texto del PDF")
 
         chunks = chunk_text(full_text)
         embeddings = []
         for chunk in chunks:
-            emb = openai.Embedding.create(input=chunk, model="text-embedding-3-small")["data"][0]["embedding"]
+            emb = openai.Embedding.create(
+                input=chunk, 
+                model="text-embedding-3-small"
+            )["data"][0]["embedding"]
             embeddings.append(emb)
+        
         index.add(np.array(embeddings))
         stored_chunks.extend(chunks)
-        return {"status": "ok", "chunks": len(chunks)}
+        return {"status": "success", "chunks": len(chunks)}
+    
     except Exception as e:
-        return {"error": str(e)}, 500
-
-
-
-# Configura CORS (¡IMPORTANTE!)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Permite todos los orígenes
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-# Modelo para validación de entrada
-class QuestionRequest(BaseModel):
-    question: str
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/ask")
-async def ask_question(request: Request):
+async def ask_question(question_data: QuestionRequest):
     try:
-        # Parsear el JSON manualmente
-        data = await request.json()
-        question = data.get("question")
-        
-        if not question:
-            raise HTTPException(status_code=400, detail="No se recibió la pregunta")
+        question = question_data.question
         
         if index.ntotal == 0 or not stored_chunks:
-            raise HTTPException(status_code=400, detail="No hay información cargada")
+            raise HTTPException(
+                status_code=400,
+                detail="Por favor carga documentos primero via /upload"
+            )
 
         # Generar embedding
         q_embedding = openai.Embedding.create(
-            input=question, 
+            input=question,
             model="text-embedding-3-small"
         )["data"][0]["embedding"]
 
@@ -86,11 +90,18 @@ async def ask_question(request: Request):
 
         # Generar respuesta con GPT
         response = openai.ChatCompletion.create(
-            model="gpt-4",  # Cambiado de "gpt-4-mini" a "gpt-4"
+            model="gpt-4",
             messages=[
-                {"role": "system", "content": "Responde basándote en el contexto proporcionado."},
-                {"role": "user", "content": f"Contexto:\n{context}\n\nPregunta: {question}"}
-            ]
+                {
+                    "role": "system",
+                    "content": "Responde basándote únicamente en el contexto proporcionado."
+                },
+                {
+                    "role": "user",
+                    "content": f"Contexto:\n{context}\n\nPregunta: {question}"
+                }
+            ],
+            temperature=0.7
         )
 
         return {
