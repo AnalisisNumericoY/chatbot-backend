@@ -11,8 +11,13 @@ import json
 from bs4 import BeautifulSoup
 from pptx import Presentation
 import httpx
+import logging
 
 app = FastAPI()
+
+# Configuración de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configuración CORS
 app.add_middleware(
@@ -200,13 +205,19 @@ async def ask_question(request: Request):
         
         question = data.get("question")
         if not question:
-            raise HTTPException(status_code=400, detail="No se recibió pregunta")
+            logger.info("Solicitud a /ask sin pregunta.")
+            return {
+                "answer": "Parece que no se ha enviado ninguna pregunta. Por favor, inténtalo de nuevo.",
+                "context": []
+            }
         
         if index.ntotal == 0:
-            raise HTTPException(
-            status_code=400,
-            detail="Actualmente no tengo documentos cargados. Puedes preguntarme cosas generales, pero para consultas específicas por favor carga documentos PDF en la página de administración."
-            )
+            logger.info("Solicitud a /ask con índice vacío.")
+            return {
+                "answer": "Actualmente no tengo documentos con los que trabajar. Por favor, pide a un administrador que suba la información necesaria (PDF, PPTX, etc.) para que pueda responder a tus preguntas.",
+                "context": []
+            }
+            
         # Generar embedding
         q_embedding = client.embeddings.create(  # Llamada actualizada
             input=question,
@@ -214,7 +225,7 @@ async def ask_question(request: Request):
         ).data[0].embedding
 
         # Búsqueda de chunks similares
-        D, I = index.search(np.array([q_embedding]), k=3)
+        _, I = index.search(np.array([q_embedding]), k=3)
         similar_chunks = [stored_chunks[i] for i in I[0] if i < len(stored_chunks)]
         context = "\n---\n".join(similar_chunks)
 
@@ -243,4 +254,5 @@ async def ask_question(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Error inesperado en /ask: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
