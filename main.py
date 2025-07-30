@@ -8,6 +8,9 @@ import numpy as np
 from dotenv import load_dotenv
 import os
 import json
+from bs4 import BeautifulSoup
+from pptx import Presentation
+import httpx
 
 app = FastAPI()
 
@@ -23,8 +26,23 @@ app.add_middleware(
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Nueva inicialización
 
-index = faiss.IndexFlatL2(1536)
-stored_chunks = []
+# --- Persistencia con Faiss y JSON ---
+FAISS_INDEX_PATH = "vectorstore.faiss"
+CHUNKS_PATH = "chunks.json"
+
+# Cargar índice y chunks si existen
+if os.path.exists(FAISS_INDEX_PATH):
+    index = faiss.read_index(FAISS_INDEX_PATH)
+else:
+    index = faiss.IndexFlatL2(1536)  # Dimensión de text-embedding-3-small
+
+if os.path.exists(CHUNKS_PATH):
+    with open(CHUNKS_PATH, 'r', encoding='utf-8') as f:
+        stored_chunks = json.load(f)
+else:
+    stored_chunks = []
+# --- Fin de la configuración de persistencia ---
+
 
 def chunk_text(text, chunk_size=1000, overlap=200):
     chunks = []
@@ -35,7 +53,36 @@ def chunk_text(text, chunk_size=1000, overlap=200):
         start += chunk_size - overlap
     return chunks
 
-@app.post("/upload")
+def process_and_store_text(text: str):
+    """Chunks text, creates embeddings, and stores them."""
+    if not text or not text.strip():
+        return 0
+    
+    chunks = chunk_text(text)
+    
+    if not chunks:
+        return 0
+
+    embeddings = []
+    for chunk in chunks:
+        emb = client.embeddings.create(
+            input=chunk,
+            model="text-embedding-3-small"
+        ).data[0].embedding
+        embeddings.append(emb)
+    
+    if embeddings:
+        index.add(np.array(embeddings))
+        stored_chunks.extend(chunks)
+
+        # Guardar cambios en disco
+        faiss.write_index(index, FAISS_INDEX_PATH)
+        with open(CHUNKS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(stored_chunks, f, ensure_ascii=False, indent=2)
+    
+    return len(chunks)
+
+@app.post("/upload_pdf")
 async def upload_file(file: UploadFile):
     try:
         # Verificar tipo de archivo
@@ -58,23 +105,85 @@ async def upload_file(file: UploadFile):
             detail="No pude leer el texto de este PDF. Por favor verifica que: \n1. El PDF contenga texto seleccionable (no sea una imagen escaneada)\n2. No esté protegido con contraseña\n3. Tenga al menos un párrafo de texto"
             )
 
-        chunks = chunk_text(full_text)
-        embeddings = []
-        for chunk in chunks:
-            emb = client.embeddings.create(  # Llamada actualizada
-                input=chunk,
-                model="text-embedding-3-small"
-            ).data[0].embedding
-            embeddings.append(emb)
+        num_chunks = process_and_store_text(full_text)
         
-        index.add(np.array(embeddings))
-        stored_chunks.extend(chunks)
-        return {"status": "success", "message": f"PDF procesado. {len(chunks)} fragmentos almacenados."}
+        if num_chunks == 0:
+            raise HTTPException(status_code=500, detail="No se pudieron procesar fragmentos del documento.")
+
+        return {"status": "success", "message": f"PDF procesado. {num_chunks} fragmentos almacenados."}
     
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al procesar PDF: {str(e)}")
+
+@app.post("/upload_pptx")
+async def upload_pptx(file: UploadFile):
+    try:
+        if not file.filename.endswith(('.pptx')):
+            raise HTTPException(status_code=400, detail="Solo se aceptan archivos .pptx")
+        
+        full_text = ""
+        presentation = Presentation(file.file)
+        for slide in presentation.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    full_text += shape.text + "\n"
+
+        if not full_text.strip():
+            raise HTTPException(status_code=400, detail="No se encontró texto en el archivo PPTX.")
+
+        num_chunks = process_and_store_text(full_text)
+
+        if num_chunks == 0:
+            raise HTTPException(status_code=500, detail="No se pudieron procesar fragmentos del documento.")
+
+        return {"status": "success", "message": f"PPTX procesado. {num_chunks} fragmentos almacenados."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al procesar PPTX: {str(e)}")
+
+class UrlRequest(BaseModel):
+    url: str
+
+@app.post("/scrape_url")
+async def scrape_url(request: UrlRequest):
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(request.url, follow_redirects=True, timeout=20.0)
+            response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        for script_or_style in soup(["script", "style"]):
+            script_or_style.decompose()
+
+        full_text = soup.get_text()
+        
+        lines = (line.strip() for line in full_text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        full_text = '\n'.join(chunk for chunk in chunks if chunk)
+
+        if not full_text.strip():
+            raise HTTPException(status_code=400, detail="No se encontró texto procesable en la URL.")
+
+        num_chunks = process_and_store_text(full_text)
+        
+        if num_chunks == 0:
+            raise HTTPException(status_code=500, detail="No se pudieron procesar fragmentos del contenido de la URL.")
+
+        return {"status": "success", "message": f"URL procesada. {num_chunks} fragmentos almacenados."}
+
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=400, detail=f"Error al acceder a la URL: {e.response.status_code} {e.request.url}")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=400, detail=f"Error de red al intentar acceder a la URL: {e.request.url}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al procesar la URL: {str(e)}")
 
 class QuestionRequest(BaseModel):
     question: str
@@ -110,13 +219,20 @@ async def ask_question(request: Request):
         context = "\n---\n".join(similar_chunks)
 
         # Generar respuesta
-        response = client.chat.completions.create(  # Llamada actualizada
+        system_prompt = """Eres un asistente virtual de atención al cliente. Tu misión es ayudar a los usuarios de forma amable y profesional.
+1.  **Analiza el contexto**: Basa tu respuesta únicamente en el fragmento de texto proporcionado en el contexto. No utilices conocimiento externo ni inventes información.
+2.  **Tono**: Mantén un tono corporativo pero cercano y amigable. Usa un lenguaje claro y evita la jerga técnica si es posible.
+3.  **Si encuentras la respuesta**: Proporciónala de manera completa y fácil de entender.
+4.  **Si NO encuentras la respuesta**: Indica amablemente que la información no se encuentra en los documentos disponibles. Ofrece alternativas, como contactar a un agente humano o revisar la pregunta.
+5.  **Cierre proactivo**: Finaliza siempre tus respuestas de forma positiva, preguntando si hay algo más en lo que puedas ayudar. Por ejemplo: '¿Hay algo más en lo que pueda asistirte hoy?'"""
+
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "Responde basándote en el contexto proporcionado."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Contexto:\n{context}\n\nPregunta: {question}"}
             ],
-            temperature=0.7
+            temperature=0.3
         )
 
         return {
