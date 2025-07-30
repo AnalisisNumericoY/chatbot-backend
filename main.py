@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, HTTPException, Request
+from fastapi import FastAPI, UploadFile, HTTPException, Request, File
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
@@ -88,7 +88,7 @@ def process_and_store_text(text: str):
     return len(chunks)
 
 @app.post("/upload_pdf")
-async def upload_file(file: UploadFile):
+async def upload_file(file: UploadFile = File(...)):
     try:
         # Verificar tipo de archivo
         if not file.filename.endswith('.pdf'):
