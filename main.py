@@ -147,8 +147,11 @@ async def upload_pptx(file: UploadFile):
         if num_chunks == 0:
             raise HTTPException(status_code=500, detail="No se pudieron procesar fragmentos del documento.")
 
-        return {"status": "success", "message": f"PPTX procesado. {num_chunks} fragmentos almacenados."}
-
+        return {
+    "status": "success",
+    "message": f"PPTX procesado. {num_chunks} fragmentos almacenados.",
+    "full_text": full_text
+}
     except HTTPException:
         raise
     except Exception as e:
