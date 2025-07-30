@@ -158,44 +158,87 @@ async def upload_pptx(file: UploadFile):
         raise HTTPException(status_code=500, detail=f"Error al procesar PPTX: {str(e)}")
 
 class UrlRequest(BaseModel):
-    url: str
+    empresaId: str = None  # Opcional para compatibilidad
+    links: list[str] = []  # Acepta el formato del frontend
+    urls: list[str] = []   # Mantiene compatibilidad con formato anterior
 
 @app.post("/scrape_url")
 async def scrape_url(request: UrlRequest):
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(request.url, follow_redirects=True, timeout=20.0)
-            response.raise_for_status()
-
-        soup = BeautifulSoup(response.text, 'html.parser')
+        # Determinar qué lista de URLs usar (compatibilidad con ambos formatos)
+        url_list = request.links if request.links else request.urls
         
-        for script_or_style in soup(["script", "style"]):
-            script_or_style.decompose()
-
-        full_text = soup.get_text()
+        # Filtrar links vacíos
+        valid_links = [link.strip() for link in url_list if link.strip()]
         
-        lines = (line.strip() for line in full_text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        full_text = '\n'.join(chunk for chunk in chunks if chunk)
-
-        if not full_text.strip():
-            raise HTTPException(status_code=400, detail="No se encontró texto procesable en la URL.")
-
-        num_chunks = process_and_store_text(full_text)
+        if not valid_links:
+            return {
+                "success": False,
+                "message": "No se proporcionaron links válidos."
+            }
         
-        if num_chunks == 0:
-            raise HTTPException(status_code=500, detail="No se pudieron procesar fragmentos del contenido de la URL.")
+        total_chunks = 0
+        processed_urls = []
+        failed_urls = []
+        
+        for url in valid_links:
+            try:
+                # Agregar https:// si no tiene protocolo
+                if not url.startswith(('http://', 'https://')):
+                    url = 'https://' + url
+                
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(url, follow_redirects=True, timeout=20.0)
+                    response.raise_for_status()
 
-        return {"status": "success", "message": f"URL procesada. {num_chunks} fragmentos almacenados."}
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                for script_or_style in soup(["script", "style"]):
+                    script_or_style.decompose()
 
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=400, detail=f"Error al acceder a la URL: {e.response.status_code} {e.request.url}")
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=400, detail=f"Error de red al intentar acceder a la URL: {e.request.url}")
+                full_text = soup.get_text()
+                
+                lines = (line.strip() for line in full_text.splitlines())
+                chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                full_text = '\n'.join(chunk for chunk in chunks if chunk)
+
+                if not full_text.strip():
+                    failed_urls.append({"url": url, "error": "No se encontró texto procesable"})
+                    continue
+
+                num_chunks = process_and_store_text(full_text)
+                total_chunks += num_chunks
+                processed_urls.append({"url": url, "chunks": num_chunks})
+                
+            except httpx.HTTPStatusError as e:
+                failed_urls.append({"url": url, "error": f"Error HTTP {e.response.status_code}"})
+            except httpx.RequestError as e:
+                failed_urls.append({"url": url, "error": f"Error de red: {str(e)}"})
+            except Exception as e:
+                failed_urls.append({"url": url, "error": f"Error inesperado: {str(e)}"})
+
+        if not processed_urls:
+            return {
+                "success": False,
+                "message": "No se pudo procesar ningún link. Revisa que las URLs sean válidas y estén accesibles.",
+                "failed_urls": failed_urls
+            }
+
+        return {
+            "success": True,
+            "message": f"✅ {len(processed_urls)} links procesados exitosamente. {total_chunks} fragmentos de información almacenados.",
+            "processed_urls": processed_urls,
+            "failed_urls": failed_urls,
+            "total_chunks": total_chunks
+        }
+
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al procesar la URL: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Error al procesar los links: {str(e)}"
+        }
 
 class QuestionRequest(BaseModel):
     question: str
