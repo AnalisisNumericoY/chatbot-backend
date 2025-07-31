@@ -13,6 +13,7 @@ from pptx import Presentation
 import httpx
 import logging
 
+
 app = FastAPI()
 
 # Configuración de logging
@@ -151,11 +152,93 @@ async def upload_pptx(file: UploadFile):
     "status": "success",
     "message": f"PPTX procesado. {num_chunks} fragmentos almacenados.",
     "full_text": full_text
-}
+        }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al procesar PPTX: {str(e)}")
+
+class ExcelRequest(BaseModel):
+    empresaId: str
+    data: list[dict]
+
+@app.post("/api/upload-excel")
+async def upload_excel(request: ExcelRequest):
+    try:
+        if not request.data:
+            return {
+                "success": False,
+                "message": "No se recibieron datos del archivo Excel."
+            }
+        
+        # Crear texto estructurado para cada fila
+        full_text = ""
+        processed_rows = 0
+        
+        for row_data in request.data:
+            # Obtener los valores de las primeras 3 columnas/keys
+            # El frontend usa XLSX que puede generar keys como __EMPTY, __EMPTY_1, etc.
+            # o usar los headers de la primera fila
+            
+            keys = list(row_data.keys())
+            if len(keys) < 3:
+                continue  # Saltar filas con menos de 3 columnas
+            
+            # Obtener pregunta, respuesta y tema (primeras 3 columnas)
+            pregunta_key = keys[0]
+            respuesta_key = keys[1] 
+            tema_key = keys[2]
+            
+            pregunta = str(row_data.get(pregunta_key, "")).strip()
+            respuesta = str(row_data.get(respuesta_key, "")).strip() 
+            tema = str(row_data.get(tema_key, "General")).strip()
+            
+            # Limpiar valores que pueden venir como "nan" o valores vacíos
+            if pregunta.lower() in ['nan', 'null', ''] or respuesta.lower() in ['nan', 'null', '']:
+                continue
+                
+            if not tema or tema.lower() in ['nan', 'null', '']:
+                tema = "General"
+            
+            # Solo procesar si hay pregunta y respuesta válidas
+            if pregunta and respuesta:
+                # Formato estructurado que ayuda al modelo a entender el contexto
+                chunk_text = f"""TEMA: {tema}
+PREGUNTA: {pregunta}
+RESPUESTA: {respuesta}
+
+---"""
+                full_text += chunk_text + "\n"
+                processed_rows += 1
+        
+        if not full_text.strip():
+            return {
+                "success": False,
+                "message": "No se encontraron preguntas y respuestas válidas en el archivo Excel."
+            }
+        
+        # Procesar y almacenar el texto
+        num_chunks = process_and_store_text(full_text)
+        
+        if num_chunks == 0:
+            return {
+                "success": False,
+                "message": "No se pudieron procesar fragmentos del documento Excel."
+            }
+        
+        return {
+            "success": True,
+            "message": f"✅ Excel procesado correctamente. {processed_rows} preguntas-respuestas almacenadas, {num_chunks} fragmentos creados.",
+            "processed_rows": processed_rows,
+            "total_chunks": num_chunks
+        }
+        
+    except Exception as e:
+        logger.error(f"Error al procesar Excel desde frontend: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"Error al procesar el archivo Excel: {str(e)}"
+        }
 
 class UrlRequest(BaseModel):
     empresaId: str = None  # Opcional para compatibilidad
@@ -167,11 +250,14 @@ async def scrape_url(request: UrlRequest):
     try:
         # Determinar qué lista de URLs usar (compatibilidad con ambos formatos)
         url_list = request.links if request.links else request.urls
+        logger.info(f"URLs recibidas: {url_list}")
         
         # Filtrar links vacíos
         valid_links = [link.strip() for link in url_list if link.strip()]
+        logger.info(f"URLs válidas después de filtrar: {valid_links}")
         
         if not valid_links:
+            logger.warning("No se proporcionaron links válidos")
             return {
                 "success": False,
                 "message": "No se proporcionaron links válidos."
@@ -186,6 +272,8 @@ async def scrape_url(request: UrlRequest):
                 # Agregar https:// si no tiene protocolo
                 if not url.startswith(('http://', 'https://')):
                     url = 'https://' + url
+                
+                logger.info(f"Procesando URL: {url}")
                 
                 async with httpx.AsyncClient() as client:
                     response = await client.get(url, follow_redirects=True, timeout=20.0)
@@ -202,34 +290,45 @@ async def scrape_url(request: UrlRequest):
                 chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
                 full_text = '\n'.join(chunk for chunk in chunks if chunk)
 
+                logger.info(f"Texto extraído de {url}: {len(full_text)} caracteres")
+                
                 if not full_text.strip():
+                    logger.warning(f"No se encontró texto procesable en {url}")
                     failed_urls.append({"url": url, "error": "No se encontró texto procesable"})
                     continue
 
                 num_chunks = process_and_store_text(full_text)
+                logger.info(f"Creados {num_chunks} chunks para {url}")
                 total_chunks += num_chunks
                 processed_urls.append({"url": url, "chunks": num_chunks})
                 
             except httpx.HTTPStatusError as e:
+                logger.error(f"Error HTTP en {url}: {e.response.status_code}")
                 failed_urls.append({"url": url, "error": f"Error HTTP {e.response.status_code}"})
             except httpx.RequestError as e:
+                logger.error(f"Error de red en {url}: {str(e)}")
                 failed_urls.append({"url": url, "error": f"Error de red: {str(e)}"})
             except Exception as e:
+                logger.error(f"Error inesperado en {url}: {str(e)}", exc_info=True)
                 failed_urls.append({"url": url, "error": f"Error inesperado: {str(e)}"})
 
+        logger.info(f"Resumen del scraping: {len(processed_urls)} URLs exitosas, {len(failed_urls)} URLs fallidas, {total_chunks} chunks totales")
+        
         if not processed_urls:
             return {
                 "success": False,
-                "message": "No se pudo procesar ningún link. Revisa que las URLs sean válidas y estén accesibles.",
-                "failed_urls": failed_urls
+                "message": f"No se pudo procesar ningún link. Se intentaron {len(valid_links)} URLs pero todas fallaron. Revisa los detalles en failed_urls.",
+                "failed_urls": failed_urls,
+                "total_attempted": len(valid_links)
             }
 
         return {
             "success": True,
-            "message": f"✅ {len(processed_urls)} links procesados exitosamente. {total_chunks} fragmentos de información almacenados.",
+            "message": f"✅ {len(processed_urls)} links procesados exitosamente. {total_chunks} fragmentos de información almacenados. {len(failed_urls)} URLs fallaron.",
             "processed_urls": processed_urls,
             "failed_urls": failed_urls,
-            "total_chunks": total_chunks
+            "total_chunks": total_chunks,
+            "total_attempted": len(valid_links)
         }
 
     except HTTPException:
