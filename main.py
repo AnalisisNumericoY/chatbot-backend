@@ -12,7 +12,8 @@ from bs4 import BeautifulSoup
 from pptx import Presentation
 import httpx
 import logging
-
+from pydantic import BaseModel
+from typing import List, Dict
 
 app = FastAPI()
 
@@ -159,8 +160,7 @@ async def upload_pptx(file: UploadFile):
         raise HTTPException(status_code=500, detail=f"Error al procesar PPTX: {str(e)}")
 
 class ExcelRequest(BaseModel):
-    empresaId: str
-    data: list[dict]
+    data: List[Dict]
 
 @app.post("/upload-excel")
 async def upload_excel(request: ExcelRequest):
