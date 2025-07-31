@@ -162,7 +162,7 @@ class ExcelRequest(BaseModel):
     empresaId: str
     data: list[dict]
 
-@app.post("/api/upload-excel")
+@app.post("/upload-excel")
 async def upload_excel(request: ExcelRequest):
     try:
         if not request.data:
