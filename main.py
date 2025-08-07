@@ -14,6 +14,22 @@ import httpx
 import logging
 from pydantic import BaseModel
 from typing import List, Dict
+from urllib.parse import urljoin
+from io import BytesIO
+
+# Intentar imports opcionales para extracción avanzada y OCR
+try:
+    import trafilatura  # type: ignore
+    HAS_TRAFILATURA = True
+except Exception:
+    HAS_TRAFILATURA = False
+
+try:
+    from PIL import Image  # type: ignore
+    import pytesseract  # type: ignore
+    HAS_OCR = True
+except Exception:
+    HAS_OCR = False
 
 app = FastAPI()
 
@@ -59,6 +75,104 @@ def chunk_text(text, chunk_size=1000, overlap=200):
         chunks.append(text[start:end])
         start += chunk_size - overlap
     return chunks
+
+# --- Extracción robusta de texto de páginas HTML ---
+async def extract_text_from_page(html: str, page_url: str, http_client: httpx.AsyncClient) -> str:
+    parts: List[str] = []
+
+    # 1) Extraer con trafilatura si está disponible (contenido principal)
+    if HAS_TRAFILATURA:
+        try:
+            extracted = trafilatura.extract(html, url=page_url, include_links=True)
+            if extracted:
+                parts.append(extracted)
+        except Exception:
+            pass
+
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # 2) Título y meta
+    try:
+        if soup.title and soup.title.string:
+            parts.append(soup.title.string.strip())
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        if meta_desc and meta_desc.get('content'):
+            parts.append(meta_desc['content'].strip())
+        og_title = soup.find('meta', property='og:title')
+        if og_title and og_title.get('content'):
+            parts.append(og_title['content'].strip())
+        og_desc = soup.find('meta', property='og:description')
+        if og_desc and og_desc.get('content'):
+            parts.append(og_desc['content'].strip())
+    except Exception:
+        pass
+
+    # 3) Texto visible de contenedores
+    try:
+        visible_text = "\n".join(s for s in soup.stripped_strings if s)
+        if visible_text:
+            parts.append(visible_text)
+    except Exception:
+        pass
+
+    # 4) Atributos accesibles alt/title/aria-label/value
+    try:
+        for el in soup.find_all(True):
+            for attr in ('alt', 'title', 'aria-label', 'value'):
+                val = el.get(attr)
+                if isinstance(val, str) and val.strip():
+                    parts.append(val.strip())
+    except Exception:
+        pass
+
+    # 5) Texto de enlaces, botones y labels
+    try:
+        for a in soup.find_all('a'):
+            txt = a.get_text(strip=True)
+            if txt:
+                parts.append(txt)
+        for b in soup.find_all(['button', 'label']):
+            txt = b.get_text(strip=True)
+            if txt:
+                parts.append(txt)
+    except Exception:
+        pass
+
+    # 6) OCR opcional en imágenes (limitado)
+    if HAS_OCR:
+        try:
+            img_tags = soup.find_all('img')[:5]
+            for img in img_tags:
+                src = img.get('src') or ''
+                if not src or src.lower().endswith('.svg'):
+                    continue
+                img_url = urljoin(page_url, src)
+                try:
+                    resp = await http_client.get(img_url, timeout=10.0)
+                    if resp.status_code == 200 and resp.content:
+                        try:
+                            image = Image.open(BytesIO(resp.content))
+                            text_ocr = pytesseract.image_to_string(image)
+                            if text_ocr and text_ocr.strip():
+                                parts.append(text_ocr.strip())
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    # Desduplicar líneas
+    combined = "\n".join(parts)
+    lines = [ln.strip() for ln in combined.splitlines() if ln and ln.strip()]
+    seen = set()
+    unique_lines: List[str] = []
+    for ln in lines:
+        if ln not in seen:
+            seen.add(ln)
+            unique_lines.append(ln)
+
+    return "\n".join(unique_lines)
 
 def process_and_store_text(text: str):
     """Chunks text, creates embeddings, and stores them."""
@@ -275,20 +389,12 @@ async def scrape_url(request: UrlRequest):
                 
                 logger.info(f"Procesando URL: {url}")
                 
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(url, follow_redirects=True, timeout=20.0)
+                async with httpx.AsyncClient() as http_client:
+                    response = await http_client.get(url, follow_redirects=True, timeout=20.0)
                     response.raise_for_status()
 
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                for script_or_style in soup(["script", "style"]):
-                    script_or_style.decompose()
-
-                full_text = soup.get_text()
-                
-                lines = (line.strip() for line in full_text.splitlines())
-                chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-                full_text = '\n'.join(chunk for chunk in chunks if chunk)
+                    # Extracción robusta (con OCR si disponible)
+                    full_text = await extract_text_from_page(response.text, url, http_client)
 
                 logger.info(f"Texto extraído de {url}: {len(full_text)} caracteres")
                 
